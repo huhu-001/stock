@@ -1,0 +1,97 @@
+# ============================================================
+#  A股量化工具配置文件
+# ============================================================
+
+data:
+  cache_dir: data/cache        # 行情缓存目录
+  history_days: 400            # 拉取多少个自然日的历史日线
+  adjust: qfq                  # 复权方式: qfq 前复权 / hfq 后复权 / "" 不复权
+  max_workers: 3               # 并发下载线程数（过大容易被数据源限流）
+  bypass_proxy: true           # 东方财富等国内行情源直连，不走代理/VPN
+  retries: 2                   # 单次请求失败重试次数
+  sources: [tencent, sina, eastmoney]   # 日线数据源，按顺序尝试，前一个失败自动换下一个
+
+output_dir: output             # 选股结果 / 报告 / 提醒日志输出目录
+
+# ---------- 股票池过滤（选股时生效） ----------
+universe:
+  exclude_st: true             # 剔除 ST / *ST / 退市整理
+  exclude_bj: true             # 剔除北交所 (8xxxxx / 4xxxxx / 92xxxx)
+  exclude_kcb: false           # 剔除科创板 (688xxx)
+  exclude_cyb: false           # 剔除创业板 (300xxx / 301xxx)
+  min_amount: 100000000        # 最低当日成交额（元），过滤流动性差的股票
+  min_total_mv: 3000000000     # 最低总市值（元）
+  min_bars: 60                 # 最少历史K线数，过滤次新股
+  all_top_n: 300               # universe=all 时，按成交额取前 N 只做技术面扫描
+
+# ---------- 策略参数 ----------
+strategies:
+  ma_cross:
+    fast: 5
+    slow: 20
+    volume_confirm: true       # 金叉当日成交量需大于 20 日均量
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+    above_zero: false          # true: 只认零轴上方的金叉
+  mean_reversion:
+    boll_period: 20
+    boll_std: 2.0
+    rsi_period: 14
+    rsi_low: 30
+    rsi_high: 70
+  multi_factor:
+    # 因子权重（方向: 1 越大越好, -1 越小越好）
+    factors:
+      chg_60d:   {weight: 0.25, direction: 1}    # 60日动量
+      chg_ytd:   {weight: 0.10, direction: 1}    # 年初至今涨幅
+      pe:        {weight: 0.25, direction: -1}   # 动态市盈率（低估值优先）
+      pb:        {weight: 0.15, direction: -1}   # 市净率
+      turnover:  {weight: 0.10, direction: 1}    # 换手率（活跃度）
+      total_mv:  {weight: 0.15, direction: -1}   # 总市值（小市值优先）
+    max_pe: 100                # 剔除 PE 过高
+    exclude_loss: true         # 剔除亏损股 (PE <= 0)
+
+# ---------- 尾盘选股（python3 main.py tail，建议 14:30 运行） ----------
+# 两个模型每天都会计算、保存并复盘：
+#   rule 反转规则（默认主模型）：近期越弱、越冷清得分越高
+#   ml   每日训练的机器学习模型（需要 pip3 install scikit-learn）
+# 旧的“追涨”规则在真实数据上明显跑输，已弃用。
+tail:
+  universe: zz500              # 选股池：zz500 / hs300 / zz1000 / all / watchlist
+  top_n: 10                    # 每天输出几只
+  min_amount_pct: 0.3          # 剔除股票池中成交额最低的 30%
+  cost: 0.0015                 # 回测往返交易成本
+  ml:
+    window: 120                # 训练窗口：最近多少个交易日
+    retrain_every: 5           # 回测时每几天重训一次（实盘每次运行都重训）
+    max_iter: 150              # 以下为 HistGradientBoosting 参数
+    learning_rate: 0.05
+    max_depth: 3
+    min_samples_leaf: 200
+
+# ---------- 扩展数据评估（tail 第 3 步 / market / auction） ----------
+deep:
+  big_order_amount: 200000     # 大单阈值：单笔成交额 ≥ 20 万元
+  max_workers: 3               # 并发请求数（东方财富容易限流，别太大）
+
+# ---------- 自选股（实时监控对象） ----------
+# 价格提醒字段均可选: above 突破价 / below 跌破价 / pct_up 涨幅% / pct_down 跌幅%
+watchlist:
+  - {code: "600519", above: 1800, below: 1300}
+  - {code: "000858"}
+  - {code: "300750", pct_up: 5, pct_down: -5}
+  - {code: "601318"}
+  - {code: "000001"}
+
+# ---------- 实时监控 ----------
+monitor:
+  interval: 60                 # 刷新间隔（秒）
+  strategies: [ma_cross, macd, mean_reversion]
+  notify:
+    console: true
+    macos: true                # macOS 系统通知（仅在 Mac 上生效）
+    webhook:
+      type: ""                 # wecom 企业微信 / dingtalk 钉钉 / feishu 飞书 / serverchan Server酱，留空关闭
+      url: ""
