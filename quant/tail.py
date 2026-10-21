@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,14 @@ from .timeutil import SESSIONS, is_trading_time, now_cn
 
 log = logging.getLogger(__name__)
 
-MODELS = {"rule": "反转规则", "pattern": "尾盘回落型", "ml": "ML模型", "combo": "综合精选"}
+MODELS = {"short": "短线五只", "rule": "反转规则", "pattern": "尾盘回落型", "trend": "趋势回踩",
+          "ml": "ML模型", "combo": "综合精选"}
+
+# 短线五只：综合所有模型，预测“明天大涨”（次日收盘涨幅 ≥ big_move）的概率并排名。止盈止损由用户自己决定。
+SHORT_DEFAULTS = {"top_n": 5, "big_move": 0.03,
+                  "take_profit": 0.015, "stop_loss": -0.03, "max_days": 3,   # 仅 exit_returns 工具函数使用
+                  "market_drop_5d": -0.03}
+RISK_NAME = r"ST|退"          # ST、*ST、退市整理股一律剔除
 
 # 尾盘回落型：由 2345 条量价规则的分段检验 + 随机对照总结而来（中证500，2025-12 ~ 2026-10）
 # 条件均为当天股票池内的横截面分位（0=最低, 1=最高）
@@ -58,6 +66,7 @@ DEFAULTS = {
     "top_n": 10,
     "min_amount_pct": 0.3,     # 剔除成交额最低的 30%
     "cost": 0.0015,            # 回测往返交易成本
+    "min_price": 2.0,          # 股价低于 2 元剔除（接近 1 元面值退市线）
     "ml": {
         "window": 120,         # 训练窗口（交易日）
         "retrain_every": 5,    # 回测时每隔几天重新训练（实盘每次运行都重新训练）
@@ -79,6 +88,7 @@ def params(cfg: dict) -> dict:
     user = cfg.get("tail") or {}
     p = {k: user.get(k, v) for k, v in DEFAULTS.items() if k != "ml"}   # 忽略旧版废弃参数
     p["ml"] = {**DEFAULTS["ml"], **(user.get("ml") or {})}
+    p["short"] = {**SHORT_DEFAULTS, **(user.get("short") or {})}
     return p
 
 
@@ -134,7 +144,15 @@ def stock_features(df: pd.DataFrame, code: str, with_forward: bool = False) -> p
     f["amt20"] = a.rolling(20).mean()
     f["amt"] = np.log(f["amt20"])
     f["limit"] = f["r1"].abs() >= limit_pct(code)
+    ma5, ma10, ma20, ma60 = (c.rolling(n).mean() for n in (5, 10, 20, 60))
+    f["trend_up"] = (ma5 > ma10) & (ma10 > ma20) & (c > ma60)      # 均线多头且站上 60 日线
+    f["trend_down"] = (c < ma20) & (ma20 < ma60)                   # 空头排列
     if with_forward:
+        for k in (1, 2, 3):
+            f[f"o{k}"] = o.shift(-k) / c - 1
+            f[f"h{k}"] = h.shift(-k) / c - 1
+            f[f"l{k}"] = l.shift(-k) / c - 1
+            f[f"c{k}"] = c.shift(-k) / c - 1
         f["ret_open"] = o.shift(-1) / c - 1
         f["ret_high"] = h.shift(-1) / c - 1
         f["ret_close"] = c.shift(-1) / c - 1
@@ -146,6 +164,7 @@ def tradable(feat: pd.DataFrame, p: dict) -> pd.DataFrame:
     """剔除涨跌停、成交额最低的一部分、因子缺失过多的行。feat 需含 date 列。"""
     x = feat.reset_index(drop=True).dropna(subset=["r1", "amt20"]).copy()
     x = x[~x["limit"]]
+    x = x[x["close"] >= p.get("min_price", 2.0)]
     x = x[x.groupby("date")["amt20"].rank(pct=True) > p["min_amount_pct"]]
     x = x[x[list(FACTORS)].notna().sum(axis=1) >= len(FACTORS) - 2]
     return x
@@ -212,8 +231,104 @@ def ml_score_today(panel: pd.DataFrame, today, p: dict) -> pd.DataFrame:
     return now
 
 
+def trend_score(x: pd.DataFrame) -> pd.Series:
+    """趋势回踩：均线多头、站上 60 日线，今天小幅回落（-3%~+0.5%）且收在当日低位（区间下 40%）。
+    收盘位置越低得分越高（0~100），不满足条件为 NaN。
+    在中证500 数据（2025-12~2026-10）上前后两段次日收益都高于股票池：+0.42% vs +0.21%，-0.06% vs -0.20%。"""
+    ok = x["trend_up"].fillna(False).astype(bool) & x["r1"].between(-0.03, 0.005) & (x["pos"] < 0.4)
+    return ((1 - x["pos"]) * 100).round(1).where(ok)
+
+
+def exit_returns(t: pd.DataFrame, tp: float, sl: float, n: int) -> np.ndarray:
+    """模拟止盈/止损/到期卖出。开盘直接越过止盈或止损按开盘价成交；同一天既碰止盈又碰止损时按止损算（保守）。"""
+    r = np.full(len(t), np.nan)
+    done = np.zeros(len(t), bool)
+    for k in range(1, n + 1):
+        o, h, l, c = (t[f"{a}{k}"].values for a in ("o", "h", "l", "c"))
+        for cond, val in ((o >= tp, o), (o <= sl, o)):
+            m = ~done & cond
+            r[m] = val[m]
+            done |= m
+        m = ~done & (l <= sl)
+        r[m] = sl
+        done |= m
+        m = ~done & (h >= tp)
+        r[m] = tp
+        done |= m
+        if k == n:
+            m = ~done
+            r[m] = c[m]
+    return r
+
+
+def short_rank(x: pd.DataFrame) -> pd.Series:
+    """多模型综合排序键：尾盘回落型条件优先（短线回测中最好），其次按四个模型的综合票数。"""
+    g = x.groupby("date")
+    vote = (0.3 * g["s_rule"].rank(pct=True).fillna(0) + 0.3 * g["s_ml"].rank(pct=True).fillna(0)
+            + 0.2 * x["s_pat"].notna() + 0.2 * x["s_trend"].notna())
+    return (x["s_pat"].notna().astype(float) + vote).round(3)
+
+
+PROB_FEATURES = None   # 运行时生成：k_* 量价特征 + 各模型信号
+
+
+def add_model_signals(x: pd.DataFrame) -> pd.DataFrame:
+    """把各模型的结果变成特征：反转分（池内排名）、是否满足尾盘回落型 / 趋势回踩条件。"""
+    x = x.copy()
+    x["f_rule"] = _rule_on(x)["score"].groupby(x["date"]).rank(pct=True)
+    x["f_pat"] = pattern_score(x).notna().astype(float)
+    x["f_trend"] = trend_score(x).notna().astype(float)
+    return x
+
+
+def prob_features() -> list:
+    return ["k_" + f for f in ML_FEATURES] + ["f_rule", "f_pat", "f_trend"]
+
+
+def fit_prob(train: pd.DataFrame, mp: dict, target: pd.Series):
+    """综合概率模型：梯度提升分类器，输出“明天满足 target”的概率。"""
+    _require_sklearn()
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    ok = target.notna()
+    m = HistGradientBoostingClassifier(max_iter=int(mp["max_iter"]),
+                                       learning_rate=float(mp["learning_rate"]),
+                                       max_depth=int(mp["max_depth"]),
+                                       min_samples_leaf=int(mp["min_samples_leaf"]),
+                                       l2_regularization=1.0, random_state=0)
+    m.fit(train.loc[ok, prob_features()].values, target[ok].astype(int).values)
+    return m
+
+
+def prob_today(panel: pd.DataFrame, asof, p: dict) -> pd.DataFrame:
+    """用 asof 之前、标签已确定的数据训练，返回 asof 当天每只股票：明日上涨概率 p_up、明日大涨概率 p_big。"""
+    mp, big = p["ml"], p["short"]["big_move"]
+    x = add_model_signals(panel)
+    dates = sorted(x["date"].unique())
+    hist_dates = [d for d in dates if d < asof][:-1][-int(mp["window"]):]
+    if len(hist_dates) < 40:
+        raise RuntimeError(f"概率模型训练数据不足（{len(hist_dates)} 天）")
+    tr = x[x["date"].isin(hist_dates)]
+    now = x[x["date"] == asof].copy()
+    up = fit_prob(tr, mp, (tr["ret_close"] > 0).where(tr["ret_close"].notna()))
+    bigm = fit_prob(tr, mp, (tr["ret_close"] >= big).where(tr["ret_close"].notna()))
+    now["p_up"] = up.predict_proba(now[prob_features()].values)[:, 1]
+    now["p_big"] = bigm.predict_proba(now[prob_features()].values)[:, 1]
+    return now
+
+
+def market_5d(panel: pd.DataFrame) -> pd.Series:
+    """股票池等权指数的 5 日涨跌（用来判断大盘是否刚经历急跌）。"""
+    m = panel.groupby("date")["r1"].mean()
+    idx = (1 + m.fillna(0)).cumprod()
+    return idx / idx.shift(5) - 1
+
+
 def _tags(r: pd.Series) -> str:
     t = []
+    if bool(r.get("trend_up", False)):
+        t.append("均线多头")
+    elif bool(r.get("trend_down", False)):
+        t.append("空头排列")
     if r["r20"] <= -0.08:
         t.append(f"20日回调{r['r20'] * 100:.0f}%")
     elif r["r20"] >= 0.1:
@@ -254,7 +369,7 @@ def _format(top: pd.DataFrame, names: dict) -> pd.DataFrame:
 
 # ----------------------------------------------------------------------------
 def pick_live(provider: BaseProvider, cfg: dict, spot: pd.DataFrame | None = None,
-              universe: str | None = None, models=("rule", "pattern", "ml")):
+              universe: str | None = None, models=("short", "rule", "pattern", "trend", "ml")):
     """实时尾盘选股。返回 ({model: 结果表}, {code: 含实时K线的日线}, {model: 错误信息})。"""
     p = params(cfg)
     universe = universe or p["universe"]
@@ -303,11 +418,26 @@ def pick_live(provider: BaseProvider, cfg: dict, spot: pd.DataFrame | None = Non
             raise SystemExit(f"超过 30% 的股票数据不是最新的（{len(stale)}/{len(last_dates)}），"
                              "结果不可靠。请稍后重新运行，或先执行 python3 main.py update -u zz500")
         panel = panel[~panel["code"].isin(stale)]
+    risky = [c for c in panel["code"].unique() if re.search(RISK_NAME, str(names.get(c, "")))]
+    if risky:
+        print(f"  已剔除 ST/退市风险股 {len(risky)} 只", file=sys.stderr)
+        panel = panel[~panel["code"].isin(risky)]
     results, errors = {}, {}
     if "ml" in models:
         panel = tradable(panel, p)
         panel = add_ml_columns(panel)
     last = panel[panel["date"] == asof]
+    if "short" in models:
+        try:
+            results["short"], results["_short_info"] = _short_live(panel, last, asof, p, names,
+                                                                  "ml" in models)
+        except Exception as e:  # noqa: BLE001
+            errors["short"] = str(e)
+    if "trend" in models:
+        base = last if "ml" in models else tradable(last, p)
+        sc = base.assign(score=trend_score(base)).dropna(subset=["score"])
+        results["trend"] = _format(sc.sort_values("score", ascending=False)
+                                   .head(int(p["top_n"])), names)
     if "pattern" in models:
         base = last if "ml" in models else tradable(last, p)
         sc = base.assign(score=pattern_score(base)).dropna(subset=["score"])
@@ -327,6 +457,57 @@ def pick_live(provider: BaseProvider, cfg: dict, spot: pd.DataFrame | None = Non
     return results, live_hist, errors
 
 
+def _short_live(panel, last, asof, p, names, with_ml: bool):
+    sp = p["short"]
+    base = last if with_ml else tradable(last, p)
+    x = base.copy()
+    x["s_rule"] = _rule_on(x)["score"]
+    x["s_pat"] = pattern_score(x)
+    x["s_trend"] = trend_score(x)
+    x["s_ml"] = np.nan
+    if with_ml:
+        try:
+            x["s_ml"] = ml_score_today(panel, asof, p).set_index("code")["score"].reindex(x["code"]).values
+        except Exception:  # noqa: BLE001
+            pass
+    x["score"] = (short_rank(x) * 50).round(1)     # 换算到 0~100（没有 sklearn 时的备用排序）
+    x["p_up"] = np.nan
+    x["p_big"] = np.nan
+    if with_ml:
+        try:
+            pr = prob_today(panel, asof, p).set_index("code")
+            x["p_up"] = pr["p_up"].reindex(x["code"]).values
+            x["p_big"] = pr["p_big"].reindex(x["code"]).values
+            x["score"] = (x["p_big"] * 100).round(1)             # 按“明天大涨”概率排名
+        except Exception as e:  # noqa: BLE001
+            log.warning("概率模型失败，改用多模型投票排序: %s", e)
+    m5 = float(market_5d(panel).get(asof, np.nan))
+    top = x.sort_values("score", ascending=False).head(int(sp["top_n"]) * 3)   # 多取一些，留给风险过滤
+    res = _format(top, names)
+    if not res.empty:
+        src = []
+        for _, r in top.iterrows():
+            s = [lab for col, lab in (("s_pat", "回落"), ("s_trend", "趋势")) if pd.notna(r[col])]
+            s += [lab for col, lab in (("s_rule", "反转"), ("s_ml", "ML"))
+                  if pd.notna(r[col]) and r[col] >= x[col].quantile(0.8)]
+            src.append("+".join(s))
+        res["入选依据"] = src
+        res.insert(5, f"明日大涨≥{sp['big_move'] * 100:.0f}%概率%", (top["p_big"].values * 100).round(1))
+        res.insert(6, "明日上涨概率%", (top["p_up"].values * 100).round(1))
+    info = {"market_5d": m5, "ok": pd.notna(m5) and m5 <= sp["market_drop_5d"], "params": sp}
+    return res, info
+
+
+def _next_day_stats(pk: pd.DataFrame, big: float, pct) -> dict:
+    return {"出手天数": int(pk["date"].nunique()),
+            "次日大涨比例%": pct((pk["ret_close"] >= big).mean()),
+            "次日收涨比例%": pct((pk["ret_close"] > 0).mean()),
+            "次日收盘平均%": pct(pk["ret_close"].mean()),
+            "次日最高平均%": pct(pk["h1"].mean()),
+            "次日最高≥3%比例%": pct((pk["h1"] >= 0.03).mean()),
+            "次日跌超3%比例%": pct((pk["ret_close"] <= -0.03).mean())}
+
+
 def _rule_on(x: pd.DataFrame) -> pd.DataFrame:
     """对已经过滤过的数据直接计算反转得分。"""
     x = x.copy()
@@ -337,7 +518,7 @@ def _rule_on(x: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------------------------------------------------------------
 def backtest(provider: BaseProvider, cfg: dict, universe: str | None = None, days: int = 250,
-             models=("rule", "pattern", "ml")):
+             models=("short", "rule", "pattern", "trend", "ml")):
     """日线回测：以当日收盘价近似 14:30 买入价，每天取得分前 N，统计次日表现。
 
     ML 模型为滚动（walk-forward）回测：每个测试日只用此前、标签已确定的数据训练。
@@ -378,6 +559,8 @@ def backtest(provider: BaseProvider, cfg: dict, universe: str | None = None, day
         scores["rule"] = _rule_on(test)["score"]
     if "pattern" in models:
         scores["pattern"] = pattern_score(test)
+    if "trend" in models:
+        scores["trend"] = trend_score(test)
     if "ml" in models:
         _require_sklearn()
         pred = pd.Series(np.nan, index=test.index)
@@ -431,7 +614,67 @@ def backtest(provider: BaseProvider, cfg: dict, universe: str | None = None, day
         "累计收益%(不计成本)": pct((1 + bench).prod() - 1),
         "累计收益%(扣成本)": "-",
     }
+    # ---- 短线卖法：止盈/止损/最多持有 N 天
+    sp = p["short"]
+    if all(f"o{k}" in test for k in (1, 2, 3)):
+        t = test.dropna(subset=["c3"]).copy()
+        t["s_rule"] = scores["rule"] if "rule" in scores else np.nan
+        t["s_pat"] = scores["pattern"] if "pattern" in scores else np.nan
+        t["s_trend"] = scores["trend"] if "trend" in scores else np.nan
+        t["s_ml"] = scores["ml"] if "ml" in scores else np.nan
+        t["s_short"] = short_rank(t)
+        t["p_up"] = np.nan
+        if "ml" in models:
+            xs = add_model_signals(pool)
+            didx = {d: i for i, d in enumerate(all_dates)}
+            up_m = None
+            big = sp["big_move"]
+            print("  概率模型滚动训练…", file=sys.stderr, flush=True)
+            for j, d in enumerate(sorted(t["date"].unique())):
+                i = didx[d]
+                if up_m is None or j % int(mp["retrain_every"]) == 0:
+                    tr = xs[xs["date"].isin(all_dates[max(0, i - 1 - int(mp["window"])):i - 1])]
+                    up_m = fit_prob(tr, mp, (tr["ret_close"] >= big).where(tr["ret_close"].notna()))
+                mt, mx = t["date"] == d, xs["date"] == d
+                pr = pd.Series(up_m.predict_proba(xs.loc[mx, prob_features()].values)[:, 1],
+                               index=xs.loc[mx, "code"].values)
+                t.loc[mt, "p_up"] = pr.reindex(t.loc[mt, "code"]).values
+            t["s_prob"] = t["p_up"]          # p_up 列此处存的是“大涨概率”
+            # 校准：预测大涨概率分档 vs 实际大涨比例
+            tt = t.dropna(subset=["p_up"])
+            bins = pd.qcut(tt["p_up"], 5, duplicates="drop")
+            calib = tt.groupby(bins, observed=True).agg(
+                预测大涨概率=("p_up", "mean"), 实际大涨比例=("ret_close", lambda s: (s >= big).mean()),
+                样本数=("p_up", "size"))
+            calib = (calib.assign(预测大涨概率=lambda d: (d["预测大涨概率"] * 100).round(1),
+                                  实际大涨比例=lambda d: (d["实际大涨比例"] * 100).round(1))
+                     .reset_index(drop=True))
+            calib.index = [f"第{i + 1}档(低→高)" for i in range(len(calib))]
+            summary["_calib"] = calib
+        mk = market_5d(pool)
+        t["m5"] = t["date"].map(mk)
+        rows = {}
+        for col, lab in (("s_prob", "短线五只（大涨概率模型）"), ("s_short", "多模型投票"),
+                         ("s_pat", "尾盘回落型"), ("s_rule", "反转规则"),
+                         ("s_trend", "趋势回踩"), ("s_ml", "ML模型")):
+            if col not in t or t[col].isna().all():
+                continue
+            for gate in (False, True):
+                tt = t[t["m5"] <= sp["market_drop_5d"]] if gate else t
+                pk = tt.dropna(subset=[col]).sort_values(["date", col], ascending=[True, False]) \
+                    .groupby("date").head(int(sp["top_n"]))
+                if pk.empty:
+                    continue
+                rows[lab + ("·大盘急跌后" if gate else "")] = _next_day_stats(pk, sp["big_move"], pct)
+        rows["股票池随机买"] = _next_day_stats(t, sp["big_move"], pct)
+        short_df = pd.DataFrame(rows).T
+        short_df.index.name = f"每天前{sp['top_n']}只 · 次日表现（大涨=收盘涨≥{sp['big_move'] * 100:.0f}%）"
+        summary["_short"] = short_df
+    short_tbl = summary.pop("_short", None)
+    calib_tbl = summary.pop("_calib", None)
     summary_df = pd.DataFrame(summary)
+    summary_df.attrs["short"] = short_tbl
+    summary_df.attrs["calib"] = calib_tbl
     summary_df.index.name = f"{len(test_dates)}个交易日"
     return summary_df, pd.concat(trades, ignore_index=True), pd.DataFrame(curves)
 

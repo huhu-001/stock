@@ -18,7 +18,7 @@ universe:
   exclude_st: true             # 剔除 ST / *ST / 退市整理
   exclude_bj: true             # 剔除北交所 (8xxxxx / 4xxxxx / 92xxxx)
   exclude_kcb: false           # 剔除科创板 (688xxx)
-  exclude_cyb: false           # 剔除创业板 (300xxx / 301xxx)
+  exclude_cyb: true            # 剔除创业板 (300xxx / 301xxx)。港股、B 股始终不包含
   min_amount: 100000000        # 最低当日成交额（元），过滤流动性差的股票
   min_total_mv: 3000000000     # 最低总市值（元）
   min_bars: 60                 # 最少历史K线数，过滤次新股
@@ -63,6 +63,10 @@ tail:
   top_n: 10                    # 每天输出几只
   min_amount_pct: 0.3          # 剔除股票池中成交额最低的 30%
   cost: 0.0015                 # 回测往返交易成本
+  min_price: 2.0               # 股价低于 2 元剔除（面值退市风险）
+  short:                       # 短线五只：综合所有模型，按“明天大涨”概率排名（止盈止损自己判断）
+    top_n: 5
+    big_move: 0.03             # “大涨”的定义：次日收盘涨幅 ≥ 3%
   ml:
     window: 120                # 训练窗口：最近多少个交易日
     retrain_every: 5           # 回测时每几天重训一次（实盘每次运行都重训）
@@ -81,7 +85,6 @@ deep:
 watchlist:
   - {code: "600519", above: 1800, below: 1300}
   - {code: "000858"}
-  - {code: "300750", pct_up: 5, pct_down: -5}
   - {code: "601318"}
   - {code: "000001"}
 

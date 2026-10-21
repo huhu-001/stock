@@ -207,7 +207,8 @@ def cmd_tail(args, cfg):
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = now_cn().strftime("%Y%m%d_%H%M")
     args.universe = args.universe or tail.params(cfg)["universe"]
-    models = ["rule", "pattern", "ml"] if _has_sklearn() else ["rule", "pattern"]
+    models = (["short", "rule", "pattern", "trend", "ml"] if _has_sklearn()
+              else ["short", "rule", "pattern", "trend"])
     if args.model == "ml" and "ml" not in models:
         raise SystemExit("ML 模型需要 scikit-learn，请执行: pip3 install scikit-learn")
     if "ml" not in models:
@@ -220,22 +221,36 @@ def cmd_tail(args, cfg):
         if summary.empty:
             raise SystemExit("回测没有可用数据。")
         print("\n尾盘选股 · 历史回测（以收盘价近似 14:30 买入，ML 为滚动训练）\n")
+        short_tbl = summary.attrs.get("short")
+        if short_tbl is not None:
+            print(f"【{short_tbl.index.name}】\n")
+            print(short_tbl.to_string())
+            cal = summary.attrs.get("calib")
+            if cal is not None:
+                print("\n【大涨概率模型校准：预测概率越高，实际大涨比例是否越高】\n")
+                print(cal.to_string())
+            print("\n【每日换仓（次日收盘卖出）对比】\n")
         print(summary.to_string())
         csv = out_dir / f"tail_backtest_trades_{stamp}.csv"
         trades.to_csv(csv, index=False, encoding="utf-8-sig")
         print(f"\n逐笔明细: {csv}")
         import plotly.graph_objects as go
         eq = (1 + curve.fillna(0)).cumprod()
-        colors = {"rule": "#e03131", "pattern": "#f08c00", "ml": "#1c7ed6", "benchmark": "#868e96"}
+        colors = {"rule": "#e03131", "pattern": "#f08c00", "trend": "#2f9e44", "ml": "#1c7ed6",
+                  "benchmark": "#868e96"}
         labels = {"rule": "反转规则（扣成本）", "pattern": "尾盘回落型（扣成本）",
-                  "ml": "ML模型（扣成本）", "benchmark": "股票池等权"}
+                  "trend": "趋势回踩（扣成本）", "ml": "ML模型（扣成本）", "benchmark": "股票池等权"}
         fig = go.Figure([go.Scatter(x=eq.index, y=eq[c], name=labels[c],
                                     line=dict(color=colors[c])) for c in eq.columns])
         fig.update_layout(title="净值曲线（每日换仓）", template="plotly_white", height=420,
                           legend=dict(orientation="h", y=1.08))
         tbl = summary.reset_index().rename(columns={summary.index.name: "指标"}).astype(str)
+        st_tbl = summary.attrs.get("short")
+        ext = [("短线卖法回测（" + st_tbl.index.name + "）", st_tbl.reset_index().rename(
+            columns={st_tbl.index.name: "模型"}).astype(str))] if st_tbl is not None else []
         p = build_report("尾盘选股 · 历史回测", tbl, None, [], out_dir / f"tail_backtest_{stamp}.html",
                          subtitle=f"股票池 {args.universe} · {summary.index.name}", cfg=cfg,
+                         extra_tables=ext,
                          extra_html="<div class='chart'>" + fig.to_html(
                              full_html=False, include_plotlyjs="directory") + "</div>")
         _open(p, args.no_open)
@@ -265,28 +280,27 @@ def cmd_tail(args, cfg):
     if args.review:
         return
 
-    # 2) 今日选股
+    # 2) 今日选股（各模型）
     results, hist, errors = tail.pick_live(provider, cfg, spot=spot, universe=args.universe,
                                            models=models)
+    short_info = results.pop("_short_info", None)
+    short_all = results.pop("short", None)
     for m, err in errors.items():
         print(f"⚠ {tail.MODELS[m]} 运行失败: {err}")
-    order = [primary] + [m for m in models if m != primary]
-    for m in order:
-        res = results.get(m)
-        if res is None:
-            continue
-        print(f"\n🎯 {now_cn():%Y-%m-%d %H:%M} 尾盘选股 · {tail.MODELS[m]} · 股票池 {args.universe}"
-              f"{'（主）' if m == primary else '（对照）'}\n")
-        print(res.to_string(index=False) if not res.empty else "没有可用数据。")
-        path = tail.save_picks(res, out_dir, model=m)
-        if path:
-            print(f"已保存: {path}")
-    print("\n说明：尾盘回落型 = 当天小跌、收在低位、换手不高、波动不大（得分越高收盘位置越低）；"
-          "反转规则得分高 = 近期越弱/越冷清；ML 得分 = 模型预测次日收益在池内的百分位。"
-          "两者回测都只接近股票池平均，请当作观察名单，不要当作买入信号。明天运行会自动复盘。")
+    others = [m for m in models if m != "short"]
+    if args.verbose_models:
+        for m in others:
+            res = results.get(m)
+            if res is None:
+                continue
+            print(f"\n— {tail.MODELS[m]}（参考）—\n")
+            print(res.to_string(index=False) if not res.empty else "没有可用数据。")
+    for m in others:
+        if results.get(m) is not None:
+            tail.save_picks(results[m], out_dir, model=m)
 
-    # 3) 扩展数据：市场情绪 + 个股综合评估（尾盘分时/大单/资金流/龙虎榜/公告）
-    combo, market = None, None
+    # 3) 扩展数据：市场情绪 + 风险过滤（公告/ST/低价/放量跳水等）
+    combo, market, full = None, None, None
     if args.fast or args.demo:
         print("\n（已跳过扩展数据评估：--fast 或 --demo）")
     else:
@@ -294,47 +308,76 @@ def cmd_tail(args, cfg):
         from quant.marketdata import MarketData
         md = MarketData(Path(cfg["data"]["cache_dir"]).parent / "archive",
                         big_order_amount=float(cfg.get("deep", {}).get("big_order_amount", 2e5)))
+        cand = dict(results)
+        if short_all is not None:
+            cand["short"] = short_all
         try:
-            combo, full, market = deep.run_deep(md, results, tail.MODELS, hist, spot, cfg)
+            combo, full, market = deep.run_deep(md, cand, tail.MODELS, hist, spot, cfg)
         except Exception as e:  # noqa: BLE001
             print(f"⚠ 扩展数据评估失败：{e}")
         if market:
             print("\n🌡 " + deep.market_text(market))
-        if combo is not None and not combo.empty:
-            gate = market and market["level"] in ("冰点", "低迷")
-            print(f"\n⭐ 综合精选（三个模型候选 + 尾盘/大单/资金/龙虎榜/公告综合打分）"
-                  f"{' —— 情绪偏冷，仅供观察' if gate else ''}\n")
-            print(combo.to_string(index=False))
-            path = tail.save_picks(combo.drop(columns=["排名"]).rename(columns={"综合分": "得分"})
-                                   .assign(排名=range(1, len(combo) + 1)), out_dir, model="combo")
-            if path:
-                print(f"已保存: {path}")
         st = md.status_table()
         if not st.empty:
-            print("\n数据来源：" + "；".join(f"{r['数据']} {r['来源/状态']}" for _, r in st.iterrows()))
-        print("说明：综合精选的加减分是经验规则，尚未经过历史检验；每天的原始数据已归档到 data/archive，"
-              "积累几周后可以检验哪些信号真的有用。")
+            print("数据来源：" + "；".join(f"{r['数据']} {r['来源/状态']}" for _, r in st.iterrows()))
+        if combo is not None and not combo.empty:
+            tail.save_picks(combo.drop(columns=["排名"]).rename(columns={"综合分": "得分"})
+                            .assign(排名=range(1, len(combo) + 1)), out_dir, model="combo")
 
-    main_res = combo if combo is not None and not combo.empty else results.get(primary)
-    if main_res is None or main_res.empty:
-        main_res = results.get("rule", pd.DataFrame())
+    # 4) 短线五只（主输出）
+    sp = tail.params(cfg)["short"]
+    short = pd.DataFrame()
+    if short_all is not None and not short_all.empty:
+        short = short_all.copy()
+        if full is not None and not full.empty:
+            bad = full[full["剔除"]]
+            reasons = dict(zip(bad["代码"], bad["扣分项"].fillna("")))
+            dropped = short[short["代码"].isin(reasons)]
+            for _, r in dropped.iterrows():
+                print(f"  剔除 {r['名称']}({r['代码']})：{reasons[r['代码']][:60]}")
+            short = short[~short["代码"].isin(reasons)]
+            extra_cols = full.set_index("代码")[[c for c in ("趋势", "尾盘形态", "大单主动买占比")
+                                                 if c in full.columns]]
+            short = short.join(extra_cols, on="代码")
+        short = short.head(int(sp["top_n"])).reset_index(drop=True)
+        short["排名"] = range(1, len(short) + 1)
+    ok = bool(short_info and short_info["ok"])
+    m5 = short_info["market_5d"] if short_info else float("nan")
+    big_col = f"明日大涨≥{sp['big_move'] * 100:.0f}%概率%"
+    print(f"\n🎯 {now_cn():%Y-%m-%d %H:%M} 短线五只（综合所有模型，按“明天大涨”概率排名）\n")
+    if short.empty:
+        print("没有可用数据。")
+    else:
+        cols = [c for c in ("排名", "代码", "名称", "现价", "涨幅%", big_col, "明日上涨概率%",
+                            "入选依据", "趋势",
+                            "尾盘形态", "20日涨幅%", "特征") if c in short.columns]
+        print(short[cols].to_string(index=False))
+        path = tail.save_picks(short, out_dir, model="short")
+        if path:
+            print(f"已保存: {path}（明天运行时自动复盘）")
+    print(f"\n股票池近 5 日 {m5 * 100:+.1f}%。")
+    print(f"说明：“明日大涨概率”= 综合模型（四个模型的信号 + 20 个量价特征，每天重新训练）预测明天收盘涨幅 ≥"
+          f"{sp['big_move'] * 100:.0f}% 的概率。普通股票这个概率大约只有 1 成，排在前面的通常是 2~3 成；"
+          "它是统计倾向，不是保证，大涨概率高的股票往往大跌概率也高。")
+
     ncfg = cfg["monitor"]["notify"]
     if args.no_notify:
         ncfg = {**ncfg, "macos": False, "webhook": {}}
     n = Notifier(ncfg, out_dir / "alerts.log")
-    if main_res.empty:
-        n.send("尾盘选股", "没有可用数据", "info")
+    if short.empty:
+        n.send("短线五只", "没有可用数据", "info")
     else:
-        body = "；".join(f"{r['名称']}({r['代码']}) {r['涨幅%']:+.1f}%"
-                        for _, r in main_res.head(10).iterrows())
-        title = "综合精选" if main_res is combo else tail.MODELS[primary]
-        temp = f"｜情绪{market['level']}" if market else ""
-        n.send(f"尾盘选股 {len(main_res)} 只（{title}{temp}）", body, "buy")
+        body = "；".join(f"{r['名称']}({r['代码']}) 大涨概率{r.get(big_col, '')}%"
+                        for _, r in short.iterrows())
+        n.send("短线五只（明天大涨概率排名）", body, "buy")
 
-    tables = [(f"{tail.MODELS[m]}（对照）", results[m]) for m in order[1:] if m in results]
-    p = build_report(f"尾盘选股 {now_cn():%Y-%m-%d} · {tail.MODELS[primary]}", main_res, hist,
+    tables = [(f"{tail.MODELS[m]}（参考）", results[m]) for m in others if m in results]
+    if combo is not None and not combo.empty:
+        tables.insert(0, ("综合精选（参考）", combo))
+    p = build_report(f"短线五只 {now_cn():%Y-%m-%d}", short, hist,
                      ["ma_cross", "macd"], out_dir / f"tail_{stamp}.html", max_charts=args.charts,
-                     subtitle="两个模型的回测都只接近股票池平均，仅作观察名单", cfg=cfg,
+                     subtitle=f"按明天大涨（收盘≥{sp['big_move'] * 100:.0f}%）概率排名；股票池近5日{m5 * 100:+.1f}%",
+                     cfg=cfg,
                      extra_tables=tables + extra)
     _open(p, args.no_open)
     print("\n" + DISCLAIMER)
@@ -381,7 +424,7 @@ def cmd_auction(args, cfg):
     hist = provider.daily_batch(codes, max_workers=int(cfg["data"]["max_workers"])) if codes else {}
     # 只用到选股日为止的日线，取“昨日成交额”
     hist = {c: df[df.index <= pd.Timestamp(prev)] for c, df in hist.items()}
-    res = auction.run(spot, archive, prev, picks_dir, hist)
+    res = auction.run(spot, archive, prev, picks_dir, hist, universe=cfg["universe"])
     print(f"\n⏰ 集合竞价验证（选股日 {prev}）\n")
     for k, v in res.items():
         if isinstance(v, pd.DataFrame):
@@ -475,7 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--no-open", action="store_true")
 
     t = sub.add_parser("tail", help="尾盘选股：14:30 筛选次日上涨概率较高的股票")
-    t.add_argument("-m", "--model", choices=["rule", "pattern", "ml"], default="rule",
+    t.add_argument("--all-models", dest="verbose_models", action="store_true",
+                   help="同时打印各单模型的名单（默认只打印短线五只）")
+    t.add_argument("-m", "--model", choices=["short", "rule", "pattern", "trend", "ml"], default="short",
                    help="主模型：rule 反转规则（默认）/ pattern 尾盘回落型 / ml 机器学习；三个都会计算并复盘")
     t.add_argument("--backtest", action="store_true", help="用历史数据回测（两个模型对比）")
     t.add_argument("--review", action="store_true", help="只复盘之前的选股结果")

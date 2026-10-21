@@ -21,7 +21,7 @@ from .marketdata import MarketData
 
 log = logging.getLogger(__name__)
 
-RISK_WORDS = re.compile(r"立案|调查|问询|监管|警示|处罚|退市|终止上市|诉讼|仲裁|冻结|违规|风险提示|减持|质押.*平仓")
+RISK_WORDS = re.compile(r"\*ST|风险警示|立案|调查|问询|监管|警示|处罚|退市|终止上市|诉讼|仲裁|冻结|违规|风险提示|减持|质押.*平仓")
 BAD_FORECAST = ("预减", "首亏", "续亏", "增亏", "略减")
 
 
@@ -65,7 +65,12 @@ def activity_features(df: pd.DataFrame | None) -> dict:
     v, a, c = df["volume"], df["amount"], df["close"]
     hi, lo = df["high"].iloc[-60:].max(), df["low"].iloc[-60:].min()
     pos = (c.iloc[-1] - lo) / (hi - lo) * 100 if hi > lo else 50
-    return {"量比": round(v.iloc[-1] / v.iloc[-6:-1].mean(), 2) if v.iloc[-6:-1].mean() else None,
+    ma5, ma10, ma20, ma60 = (c.rolling(n).mean().iloc[-1] for n in (5, 10, 20, 60))
+    last = c.iloc[-1]
+    trend = ("多头" if ma5 > ma10 > ma20 and last > ma60 else
+             "空头" if last < ma20 < ma60 else "震荡")
+    return {"趋势": trend, "20日涨幅%": round((last / c.iloc[-21] - 1) * 100, 1) if len(c) > 21 else None,
+            "量比": round(v.iloc[-1] / v.iloc[-6:-1].mean(), 2) if v.iloc[-6:-1].mean() else None,
             "换手%": round(float(df["turnover"].iloc[-1]), 2) if "turnover" in df else None,
             "成交额/5日均": round(a.iloc[-1] / a.iloc[-6:-1].mean(), 2) if a.iloc[-6:-1].mean() else None,
             "60日位置%": round(pos, 0),
@@ -90,8 +95,13 @@ def lhb_features(seats: pd.DataFrame | None) -> dict:
             "机构游资共振": bool(inst_net > 0 and hot_net > 0)}
 
 
-def event_flags(code: str, notices, forecasts, unlocks, reductions) -> list[str]:
+def event_flags(code: str, notices, forecasts, unlocks, reductions, name: str = "",
+                price=None) -> list[str]:
     flags = []
+    if re.search(r"ST|退", str(name)):
+        flags.append("ST/退市风险股")
+    if price is not None and pd.notna(price) and float(price) < 2:
+        flags.append(f"股价{float(price):.2f}元，接近面值退市线")
     if notices is not None:
         n = notices[notices["代码"] == code]
         for _, r in n.iterrows():
@@ -149,6 +159,10 @@ def score_row(r: dict) -> tuple[float, list[str], list[str], bool]:
     inst = r.get("机构净额(万)")
     adj(inst is not None and inst < -1000, -5, "机构净卖出")
     adj(bool(r.get("在主线板块")), 4, "属于今日强势板块")
+    adj(r.get("趋势") == "多头", 6, "均线多头趋势")
+    adj(r.get("趋势") == "空头", -8, "空头排列（下跌趋势中）")
+    r20 = r.get("20日涨幅%")
+    adj(r20 is not None and r20 <= -20, -6, "20日跌超20%，警惕接飞刀")
     flags = r.get("风险事件") or []
     for f in flags:
         score -= 15
@@ -183,7 +197,8 @@ def evaluate(md: MarketData, candidates: pd.DataFrame, hist: dict, day: str,
         r["所属行业"] = industry.get(code) or (md.industry(code) if hot_sectors else "")
         r["在主线板块"] = bool(r["所属行业"]) and r["所属行业"] in hot_sectors
         r["风险事件"] = event_flags(code, events.get("notices"), events.get("forecasts"),
-                                  events.get("unlocks"), events.get("reductions"))
+                                  events.get("unlocks"), events.get("reductions"),
+                                  name=r.get("名称", ""), price=r.get("现价"))
         s, plus, minus, excl = score_row(r)
         r.update({"综合分": s, "加分项": "；".join(plus), "扣分项": "；".join(minus),
                   "剔除": excl, "风险事件": "；".join(r["风险事件"])})
@@ -199,7 +214,7 @@ def evaluate(md: MarketData, candidates: pd.DataFrame, hist: dict, day: str,
     return out.sort_values(["剔除", "综合分"], ascending=[True, False]).reset_index(drop=True)
 
 
-DISPLAY_COLS = ["代码", "名称", "现价", "涨幅%", "综合分", "来源模型", "尾盘形态", "尾盘涨跌%",
+DISPLAY_COLS = ["代码", "名称", "现价", "涨幅%", "综合分", "来源模型", "趋势", "20日涨幅%", "尾盘形态",
                 "大单主动买占比", "主力净占比%", "量比", "位置", "上龙虎榜", "加分项", "扣分项"]
 
 

@@ -351,7 +351,74 @@ def test_pattern_conditions():
 def test_tail_three_models(cfg):
     cfg["universe"]["min_amount"] = 0
     results, hist, errors = tail.pick_live(MockProvider(), cfg, universe="hs300")
-    assert set(results) == {"rule", "pattern", "ml"} and not errors
+    assert {"short", "rule", "pattern", "trend", "ml"} <= set(results) and not errors
     assert len(results["pattern"]) <= 10
     summary, trades, curve = tail.backtest(MockProvider(), cfg, "hs300", days=120)
     assert "尾盘回落型" in summary.columns and "pattern" in curve.columns
+
+
+def test_code_filter_excludes_cyb_and_hk():
+    from quant.screener import code_allowed
+    u = {"exclude_bj": True, "exclude_cyb": True, "exclude_kcb": False}
+    assert code_allowed("600519", u) and code_allowed("000001", u) and code_allowed("688981", u)
+    assert not code_allowed("300750", u) and not code_allowed("301001", u)   # 创业板
+    assert not code_allowed("00700", u) and not code_allowed("hk00700", u)   # 港股
+    assert not code_allowed("830799", u) and not code_allowed("900901", u)   # 北交所 / B 股
+
+
+def test_resolve_universe_applies_code_filter(cfg):
+    from quant.screener import resolve_universe
+    cfg["universe"]["exclude_cyb"] = True
+    codes = resolve_universe(MockProvider(), cfg, "600519,300750,000858", None)
+    assert codes == ["600519", "000858"]
+
+
+def test_trend_score_requires_uptrend():
+    x = pd.DataFrame({"date": pd.Timestamp("2026-10-21"), "trend_up": [True, False, True, True],
+                      "r1": [-0.01, -0.01, 0.03, -0.01], "pos": [0.2, 0.2, 0.2, 0.7]})
+    s = tail.trend_score(x)
+    assert s.notna().tolist() == [True, False, False, False]
+    assert s.iloc[0] == 80.0
+
+
+def test_low_price_excluded_from_tradable():
+    close = list(np.linspace(1.6, 1.8, 90))
+    f = tail.stock_features(make_df(close), "600157")
+    f["date"] = f.index
+    f["turn"] = 2.0
+    assert tail.tradable(f, {**tail.DEFAULTS, "min_amount_pct": 0}).empty
+
+
+def test_delisting_flags():
+    from quant import insight
+    assert insight.event_flags("600001", None, None, None, None, name="*ST某某", price=5)
+    assert insight.event_flags("600157", None, None, None, None, name="永泰能源", price=1.42)
+    assert not insight.event_flags("600519", None, None, None, None, name="贵州茅台", price=1500)
+
+
+def test_exit_returns_rules():
+    t = pd.DataFrame({
+        "o1": [0.0, 0.02, -0.04, 0.0], "h1": [0.016, 0.03, 0.0, 0.005], "l1": [-0.01, 0.0, -0.05, -0.01],
+        "c1": [0.01, 0.02, -0.04, 0.0],
+        "o2": [0] * 4, "h2": [0] * 4, "l2": [0] * 4, "c2": [0] * 4,
+        "o3": [0] * 4, "h3": [0.0, 0, 0, 0.003], "l3": [0] * 4, "c3": [0.0, 0, 0, 0.002]})
+    r = tail.exit_returns(t, 0.015, -0.03, 3)
+    assert r[0] == pytest.approx(0.015)      # 盘中冲到止盈
+    assert r[1] == pytest.approx(0.02)       # 高开直接越过止盈，按开盘价
+    assert r[2] == pytest.approx(-0.04)      # 低开越过止损，按开盘价
+    assert r[3] == pytest.approx(0.002)      # 到期按第 3 天收盘
+
+
+def test_short_live_and_backtest(cfg):
+    cfg["universe"]["min_amount"] = 0
+    results, hist, errors = tail.pick_live(MockProvider(), cfg, universe="hs300")
+    s = results["short"]
+    assert len(s) >= 5 and {"明日大涨≥3%概率%", "明日上涨概率%", "入选依据"} <= set(s.columns)
+    assert s["明日大涨≥3%概率%"].between(0, 100).all() and s["明日大涨≥3%概率%"].is_monotonic_decreasing
+    info = results["_short_info"]
+    assert "market_5d" in info and isinstance(info["ok"], bool)
+    summary, trades, curve = tail.backtest(MockProvider(), cfg, "hs300", days=120)
+    st = summary.attrs["short"]
+    assert "短线五只（大涨概率模型）" in st.index and "股票池随机买" in st.index
+    assert summary.attrs["calib"] is not None
+    assert s["明日上涨概率%"].between(0, 100).all()

@@ -59,6 +59,7 @@ python3 main.py --demo monitor --once
 |---|---|
 | `rule` 反转规则（默认主模型） | 当日涨幅、K线实体、偏离20日线、20日涨幅、收盘相对均价、量比、换手、波动率、RSI6 这 9 项，在股票池内越弱越冷清，得分越高 |
 | `pattern` 尾盘回落型 | 当天在股票池里属于小跌（涨幅 20%–60% 分位）、收盘在当天低位（最低的 40%）、换手不在最高的 40%、波动不在最高的 20%，收盘位置越低排名越前。由 2345 条量价规则分段检验后总结而来 |
+| `trend` 趋势回踩 | 均线多头（MA5>MA10>MA20）且站上 60 日线，今天小幅回落（−3%~+0.5%）、收在当天低位。选的是上涨趋势中的回调股，不是下跌股 |
 | `ml` 每日训练模型 | 每次运行用最近 120 个交易日重新训练 HistGradientBoosting，输入 20 个量价特征（横截面排名），预测次日收益在池内的排名；训练只用标签已经确定的数据 |
 
 两个模型都会剔除涨跌停股票和成交额最低的 30%。
@@ -67,6 +68,7 @@ python3 main.py --demo monitor --once
 python3 main.py tail                # 复盘 + 今日选股（以反转规则为主，ML 作对照）
 python3 main.py tail -m ml          # 以 ML 模型为主
 python3 main.py tail -m pattern     # 以尾盘回落型为主
+python3 main.py tail -m trend       # 以趋势回踩为主
 python3 main.py tail --backtest     # 两个模型的历史回测对比（ML 为滚动训练）
 python3 main.py tail --review       # 只看历史复盘
 python3 main.py tail -u hs300       # 换股票池
@@ -122,6 +124,13 @@ class MyStrategy(Strategy):
         df["reason"] = up.map({True: "放量创20日新高", False: ""})
         return df
 ```
+
+## 风险股过滤
+
+- ST、*ST、退市整理股一律剔除。
+- 股价低于 2 元的剔除（接近 1 元面值退市线），可在 `config.yaml` 的 `tail.min_price` 调整。
+- 公告里出现立案、问询、风险警示、退市等字样的股票，在综合精选里剔除。
+- 创业板、北交所、港股、B 股不在股票池里。
 
 ## 扩展数据：情绪、资金、分时、竞价、消息
 

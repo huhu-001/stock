@@ -49,8 +49,11 @@ def judge(gap: float, ratio: float | None) -> str:
 
 
 def run(spot: pd.DataFrame, archive_root: Path, prev_day: str, picks_dir: Path,
-        hist: dict | None = None) -> dict:
+        hist: dict | None = None, universe: dict | None = None) -> dict:
     out = {}
+    if universe is not None:
+        from .screener import code_allowed
+        spot = spot[spot["code"].map(lambda c: code_allowed(c, universe))]
     prev_amount = {}
     if hist:
         for c, df in hist.items():

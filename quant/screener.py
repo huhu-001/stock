@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 
 import pandas as pd
@@ -26,6 +27,22 @@ def _progress(i: int, n: int):
         print(f"  已下载 {i}/{n}", file=sys.stderr, flush=True)
 
 
+def code_allowed(code, u: dict) -> bool:
+    """按代码过滤：只保留沪深 A 股；按配置剔除创业板 / 科创板 / 北交所；港股、B 股一律不要。"""
+    c = str(code).strip()
+    if not re.fullmatch(r"\d{6}", c):          # 港股是 5 位代码，带 hk 前缀等都排除
+        return False
+    if c.startswith(("900", "200")):          # B 股
+        return False
+    if u.get("exclude_bj", True) and re.match(r"^(8|4|92)", c):
+        return False
+    if u.get("exclude_kcb") and c.startswith(("688", "689")):
+        return False
+    if u.get("exclude_cyb") and c.startswith(("300", "301")):
+        return False
+    return True
+
+
 def apply_universe_filters(spot: pd.DataFrame, u: dict) -> pd.DataFrame:
     df = spot.copy()
     code = df["code"].astype(str)
@@ -40,6 +57,7 @@ def apply_universe_filters(spot: pd.DataFrame, u: dict) -> pd.DataFrame:
         code = df["code"].astype(str)
     if u.get("exclude_cyb"):
         df = df[~code.str.match(r"^30[01]")]
+    df = df[df["code"].map(lambda c: code_allowed(c, u))]
     if "price" in df:
         df = df[df["price"] > 0]  # 剔除停牌（无最新价）
     if u.get("min_amount") and "amount" in df:
@@ -60,6 +78,18 @@ def get_spot_safe(provider: BaseProvider) -> pd.DataFrame | None:
 
 def resolve_universe(provider: BaseProvider, cfg: dict, universe: str,
                      spot: pd.DataFrame | None) -> list[str]:
+    """解析股票池，并统一按代码剔除创业板/科创板/北交所/港股（见 config.yaml 的 universe）。"""
+    codes = _resolve_universe_raw(provider, cfg, universe, spot)
+    u = cfg["universe"]
+    kept = [c for c in codes if code_allowed(c, u)]
+    if len(kept) < len(codes):
+        print(f"  已按配置剔除 {len(codes) - len(kept)} 只（创业板/科创板/北交所/港股等）",
+              file=sys.stderr)
+    return kept
+
+
+def _resolve_universe_raw(provider: BaseProvider, cfg: dict, universe: str,
+                          spot: pd.DataFrame | None) -> list[str]:
     """把股票池名称解析为代码列表。
 
     watchlist           自选股（config.yaml）
