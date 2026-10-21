@@ -167,7 +167,7 @@ class MyStrategy(Strategy):
 - **AKShare 接口变了**：`pip install -U akshare` 升级。
 
 
-python3 main.py tail       # 14:30 后：三个模型 + 综合评估，输出“综合精选”10 只和情绪温度
-python3 main.py market     # 只看市场情绪
-python3 main.py auction    # 第二天 9:25 后：验证昨天的选股
-python3 main.py tail --fast  # 想快一点，跳过扩展数据
+python3 main.py tail                # 尾盘运行，出“短线五只”
+python3 main.py tail --all-models   # 同时显示各单模型的名单作参考
+python3 main.py tail --backtest     # 看上面这些回测数字
+
