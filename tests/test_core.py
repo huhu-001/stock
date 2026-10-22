@@ -422,3 +422,20 @@ def test_short_live_and_backtest(cfg):
     assert "短线五只（大涨概率模型）" in st.index and "股票池随机买" in st.index
     assert summary.attrs["calib"] is not None
     assert s["明日上涨概率%"].between(0, 100).all()
+
+
+def test_plan_levels_and_table():
+    from quant import plan
+    df = make_df(list(np.linspace(10, 11, 40)))
+    lv = plan.levels("600156", 10.0, df)
+    lo, hi = map(float, lv["参考买入区间"].split("-"))
+    tp1, tp2 = map(float, lv["明日参考止盈"].split("~"))
+    assert lo < 10 < hi and 10.2 <= tp1 <= tp2 <= 11.0 and 9.5 <= float(lv["严格止损"]) < 10
+    short = pd.DataFrame({"排名": [1], "代码": ["600156"], "名称": ["华升股份"], "现价": [10.0],
+                          "明日大涨≥3%概率%": [27.0], "入选依据": ["回落+趋势"]})
+    full = pd.DataFrame({"代码": ["600156"], "所属行业": ["纺织"], "主力净占比%": [6.0], "量比": [1.8],
+                         "换手%": [5.2], "在主线板块": [True]})
+    t = plan.build_table(short, full, {"600156": df}, "明日大涨≥3%概率%")
+    r = t.iloc[0]
+    assert r["板块"] == "纺织"
+    assert "大涨概率27%" in r["核心逻辑"] and "主力净流入" in r["核心逻辑"] and "板块今日走强" in r["核心逻辑"]

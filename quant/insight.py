@@ -194,7 +194,7 @@ def evaluate(md: MarketData, candidates: pd.DataFrame, hist: dict, day: str,
         r["上龙虎榜"] = code in lhb_codes
         if r["上龙虎榜"]:
             r.update(lhb_features(md.lhb_seats(code, day)))
-        r["所属行业"] = industry.get(code) or (md.industry(code) if hot_sectors else "")
+        r["所属行业"] = industry.get(code) or md.industry(code)
         r["在主线板块"] = bool(r["所属行业"]) and r["所属行业"] in hot_sectors
         r["风险事件"] = event_flags(code, events.get("notices"), events.get("forecasts"),
                                   events.get("unlocks"), events.get("reductions"),

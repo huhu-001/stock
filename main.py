@@ -324,7 +324,7 @@ def cmd_tail(args, cfg):
             tail.save_picks(combo.drop(columns=["排名"]).rename(columns={"综合分": "得分"})
                             .assign(排名=range(1, len(combo) + 1)), out_dir, model="combo")
 
-    # 4) 短线五只（主输出）
+    # 4) 短线精选（主输出）
     sp = tail.params(cfg)["short"]
     short = pd.DataFrame()
     if short_all is not None and not short_all.empty:
@@ -344,14 +344,25 @@ def cmd_tail(args, cfg):
     ok = bool(short_info and short_info["ok"])
     m5 = short_info["market_5d"] if short_info else float("nan")
     big_col = f"明日大涨≥{sp['big_move'] * 100:.0f}%概率%"
-    print(f"\n🎯 {now_cn():%Y-%m-%d %H:%M} 短线五只（综合所有模型，按“明天大涨”概率排名）\n")
+    print(f"\n🎯 {now_cn():%Y-%m-%d %H:%M} 短线精选 {len(short)} 只（综合所有模型，按“明天大涨”概率排名）\n")
     if short.empty:
         print("没有可用数据。")
     else:
-        cols = [c for c in ("排名", "代码", "名称", "现价", "涨幅%", big_col, "明日上涨概率%",
-                            "入选依据", "趋势",
-                            "尾盘形态", "20日涨幅%", "特征") if c in short.columns]
+        from quant import plan
+        table = plan.build_table(short, full, hist, big_col)
+        add = ["板块", "参考买入区间", "明日参考止盈", "严格止损", "核心逻辑"]
+        short = short.drop(columns=[c for c in add if c in short.columns]).merge(
+            table[["代码"] + add], on="代码", how="left")
+        # 原有字段 + 新增字段
+        cols = [c for c in ("排名", "代码", "名称", "板块", "现价", "涨幅%", big_col, "明日上涨概率%",
+                            "参考买入区间", "明日参考止盈", "严格止损", "入选依据", "趋势", "尾盘形态",
+                            "20日涨幅%", "特征", "核心逻辑") if c in short.columns]
         print(short[cols].to_string(index=False))
+        csv = out_dir / f"短线精选_{now_cn():%Y%m%d}.csv"
+        short[cols].to_csv(csv, index=False, encoding="utf-8-sig")
+        print(f"\n表格已保存（可用 Excel 打开）: {csv}")
+        print("价位说明：买入区间、止盈、止损按个股近 14 日平均波动（ATR）计算，波动大的区间更宽；"
+              "只是参考，没有经过回测，最终由你自己判断。")
         path = tail.save_picks(short, out_dir, model="short")
         if path:
             print(f"已保存: {path}（明天运行时自动复盘）")
